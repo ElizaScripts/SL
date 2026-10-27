@@ -1,1 +1,428 @@
+repeat task.wait() until game:IsLoaded()
 
+--============================================================
+-- RAYFIELD UI SETUP
+--============================================================
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local Window = Rayfield:CreateWindow({
+   Name = "Unnamed Rage",
+   LoadingTitle = "Unnamed Rage",
+   LoadingSubtitle = "by AI",
+   ConfigurationSaving = { Enabled = false },
+   KeySystem = false
+})
+
+--============================================================
+-- FIX: MAKE UI VISIBLE OVER THE ESC MENU
+--============================================================
+task.wait(0.5)
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+for _, gui in pairs(game:GetService("CoreGui"):GetChildren()) do
+    if gui.Name == "Rayfield" and gui:IsA("ScreenGui") then
+        pcall(function()
+            gui.Parent = playerGui
+            gui.DisplayOrder = 999999
+            gui.ResetOnSpawn = false
+        end)
+        break
+    end
+end
+
+for _, gui in pairs(playerGui:GetChildren()) do
+    if gui.Name == "Rayfield" and gui:IsA("ScreenGui") then
+        pcall(function()
+            gui.DisplayOrder = 999999
+            gui.ResetOnSpawn = false
+        end)
+        break
+    end
+end
+--============================================================
+
+local MainTab = Window:CreateTab("Main", 4483362458)
+
+--============================================================
+-- VARIABLES & STATE
+--============================================================
+local RageEnabled = false
+local CurrentTarget = nil
+local FollowConnection = nil
+local ClickLoopThread = nil
+local InVoid = false
+
+-- Teamcheck State
+local TeamcheckEnabled = false
+local tempTeammates = {}
+
+local SelectedWeapon = "Primary"
+local WeaponSlotMap = {
+    Primary = Enum.KeyCode.One,
+    Secondary = Enum.KeyCode.Two,
+    Melee = Enum.KeyCode.Three
+}
+
+-- Void Spam State
+local VoidSpamEnabled = false
+local TimeInVoid = 2
+local ShootingInterval = 0.3
+local NextVoidCycle = 0
+local IsInVoidCycle = false
+
+-- Desync Variables
+local _dsRestoreRoot, _dsRestoreCF = nil, nil
+local _dsRestoreVel, _dsRestoreRot = Vector3.zero, Vector3.zero
+local _dsBound = false
+
+--============================================================
+-- TEAMCHECK LOGIC
+--============================================================
+local function SnapshotTeammates()
+    table.clear(tempTeammates)
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local hum = plr.Character:FindFirstChild("Humanoid")
+            local root = plr.Character:FindFirstChild("HumanoidRootPart")
+            
+            if hum and root and hum.Health > 0 then
+                -- If they are within 30 studs, add them to the table
+                if (root.Position - myRoot.Position).Magnitude <= 30 then
+                    tempTeammates[plr] = true
+                end
+            end
+        end
+    end
+end
+
+local function IsTeammate(plr)
+    if plr == LocalPlayer then return true end
+    if TeamcheckEnabled and tempTeammates[plr] then return true end
+    return false
+end
+
+--============================================================
+-- DESYNC CAMERA SPOOF LOGIC
+--============================================================
+local function flushDesync()
+    if _dsRestoreRoot and _dsRestoreRoot.Parent and _dsRestoreCF then
+        pcall(function()
+            _dsRestoreRoot.CFrame = _dsRestoreCF
+            _dsRestoreRoot.AssemblyLinearVelocity = _dsRestoreVel
+            _dsRestoreRoot.AssemblyAngularVelocity = _dsRestoreRot
+        end)
+    end
+    _dsRestoreRoot, _dsRestoreCF = nil, nil
+end
+
+local function startDsRenderStep()
+    if not _dsBound then
+        _dsBound = true
+        RunService:BindToRenderStep("__rb_ds_restore", Enum.RenderPriority.Camera.Value - 1, function()
+            if _dsRestoreCF then flushDesync() end
+        end)
+    end
+end
+
+local function applyDesync(desyncCF)
+    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if myRoot then
+        _dsRestoreRoot = myRoot
+        _dsRestoreCF = myRoot.CFrame
+        _dsRestoreVel = myRoot.AssemblyLinearVelocity
+        _dsRestoreRot = myRoot.AssemblyAngularVelocity
+        myRoot.CFrame = desyncCF
+        return true
+    end
+    return false
+end
+
+--============================================================
+-- UI ELEMENTS
+--============================================================
+
+local RageToggle = MainTab:CreateToggle({
+   Name = "Rage (Press Z)",
+   CurrentValue = false,
+   Flag = "RageToggle",
+   Callback = function(Value)
+       RageEnabled = Value
+       if Value then
+           StartFollowRage()
+       else
+           StopFollowRage()
+       end
+   end,
+})
+
+MainTab:CreateDropdown({
+   Name = "Select Weapon Slot",
+   Options = {"Primary", "Secondary", "Melee"},
+   CurrentOption = {"Primary"},
+   Flag = "WeaponDropdown",
+   MultipleOptions = false,
+   Callback = function(Options)
+       SelectedWeapon = Options[1]
+   end,
+})
+
+-- TEAMCHECK UI
+local TeamcheckToggle = MainTab:CreateToggle({
+   Name = "Snapshot Teamcheck (30 Studs)",
+   CurrentValue = false,
+   Flag = "TeamcheckToggle",
+   Callback = function(Value)
+       TeamcheckEnabled = Value
+       if Value then
+           SnapshotTeammates() -- Takes snapshot immediately when toggled on
+       else
+           table.clear(tempTeammates) -- Clears when turned off
+       end
+   end,
+})
+
+-- VOID SPAM UI
+local VoidSpamToggle = MainTab:CreateToggle({
+   Name = "Void Spam",
+   CurrentValue = false,
+   Flag = "VoidSpamToggle",
+   Callback = function(Value)
+       VoidSpamEnabled = Value
+   end,
+})
+
+local TimeInVoidSlider = MainTab:CreateSlider({
+   Name = "Time In Void",
+   Range = {0, 10},
+   Increment = 0.1,
+   Suffix = "s",
+   CurrentValue = 2,
+   Flag = "TimeInVoidSlider",
+   Callback = function(Value)
+       TimeInVoid = Value
+   end,
+})
+
+local ShootingIntervalSlider = MainTab:CreateSlider({
+   Name = "Shooting Interval",
+   Range = {0, 10},
+   Increment = 0.1,
+   Suffix = "s",
+   CurrentValue = 0.3,
+   Flag = "ShootingIntervalSlider",
+   Callback = function(Value)
+       ShootingInterval = Value
+   end,
+})
+
+--============================================================
+-- Z KEYBIND
+--============================================================
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.Z then
+        RageToggle:Set(RageEnabled == false)
+        RageEnabled = not RageEnabled
+        if RageEnabled then StartFollowRage() else StopFollowRage() end
+    end
+end)
+
+--============================================================
+-- AUTO SHOOT LOGIC
+--============================================================
+local function StartClickingLoop()
+    if ClickLoopThread then task.cancel(ClickLoopThread) end
+    
+    ClickLoopThread = task.spawn(function()
+        while RageEnabled do
+            -- Only shoot if we have a target and NOT in void cycle
+            if CurrentTarget and CurrentTarget.Character and not IsInVoidCycle then
+                local tChar = CurrentTarget.Character
+                local tHum = tChar:FindFirstChild("Humanoid")
+                
+                if tHum and tHum.Health > 0 then
+                    if not tChar:FindFirstChildOfClass("ForceField") then
+                        pcall(function()
+                            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+                            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+                        end)
+                    end
+                end
+            end
+            task.wait(0.001)
+        end
+    end)
+end
+
+--============================================================
+-- MAIN LOGIC (FOLLOW LOCK & VOID SPAM)
+--============================================================
+local function GetNearestPlayer()
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+
+    local nearest = nil
+    local shortest = 500
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            -- TEAMCHECK: Skip teammates
+            if IsTeammate(plr) then continue end
+            
+            local hum = plr.Character:FindFirstChild("Humanoid")
+            local root = plr.Character:FindFirstChild("HumanoidRootPart")
+            
+            if hum and root and hum.Health > 0 then
+                local dist = (root.Position - myRoot.Position).Magnitude
+                if dist < shortest then
+                    shortest = dist
+                    nearest = plr
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function EquipSelectedWeapon()
+    local slotKey = WeaponSlotMap[SelectedWeapon]
+    if slotKey then
+        if not UserInputService:IsKeyDown(slotKey) then
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, slotKey, false, game)
+                task.wait(0.05)
+                VirtualInputManager:SendKeyEvent(false, slotKey, false, game)
+            end)
+        end
+    end
+end
+
+function StartFollowRage()
+    if FollowConnection then FollowConnection:Disconnect() end
+    startDsRenderStep()
+    StartClickingLoop()
+    InVoid = false
+    NextVoidCycle = tick() + TimeInVoid
+
+    FollowConnection = RunService.RenderStepped:Connect(function()
+        if not RageEnabled then return end
+
+        local myChar = LocalPlayer.Character
+        local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+        local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+        if not myRoot or not myHum or myHum.Health <= 0 then return end
+
+        -- Target logic
+        if not CurrentTarget or not CurrentTarget.Character then
+            CurrentTarget = GetNearestPlayer()
+        end
+        
+        if CurrentTarget then
+            local tHum = CurrentTarget.Character:FindFirstChild("Humanoid")
+            if not tHum or tHum.Health <= 0 then
+                CurrentTarget = GetNearestPlayer()
+            end
+        end
+
+        local camera = Workspace.CurrentCamera
+
+        if CurrentTarget and CurrentTarget.Character then
+            local tRoot = CurrentTarget.Character:FindFirstChild("HumanoidRootPart")
+            local tHead = CurrentTarget.Character:FindFirstChild("Head")
+            
+            if tRoot and tHead then
+                -- HANDLE VOID SPAM LOGIC
+                if VoidSpamEnabled then
+                    if tick() >= NextVoidCycle then
+                        IsInVoidCycle = not IsInVoidCycle
+                        if IsInVoidCycle then
+                            -- Going to void
+                            NextVoidCycle = tick() + TimeInVoid
+                            myRoot.CFrame = CFrame.new(0, -10000, 0) -- Teleport to void
+                            
+                            if camera then
+                                camera.CameraType = Enum.CameraType.Scriptable
+                                local voidPos = Vector3.new(0, -10000, 0)
+                                camera.CFrame = CFrame.new(voidPos, voidPos - Vector3.new(0, 1, 0))
+                            end
+                        else
+                            -- Coming back to shoot
+                            NextVoidCycle = tick() + ShootingInterval
+                        end
+                    end
+                else
+                    IsInVoidCycle = false
+                end
+
+                -- If not currently hiding in the void, glue to enemy and shoot
+                if not IsInVoidCycle then
+                    InVoid = false
+                    local targetPos = tRoot.Position + Vector3.new(0, 1, 0)
+                    myRoot.CFrame = CFrame.new(targetPos, tRoot.Position + tRoot.CFrame.LookVector)
+                    
+                    -- Shoot/Desync immediately
+                    if not CurrentTarget.Character:FindFirstChildOfClass("ForceField") then
+                        local aimPos = tHead.Position + tRoot.AssemblyLinearVelocity * 0.15
+                        local desyncCF = CFrame.lookAt(targetPos, aimPos)
+                        applyDesync(desyncCF)
+                    end
+
+                    if camera then
+                        camera.CameraType = Enum.CameraType.Custom
+                        local lookDownPos = myRoot.Position + Vector3.new(0, 5, 0)
+                        camera.CFrame = CFrame.new(lookDownPos, lookDownPos - Vector3.new(0, 1, 0))
+                    end
+                end
+            end
+        else
+            -- Target is dead or far away: Teleport to VOID
+            IsInVoidCycle = false
+            if not InVoid then
+                InVoid = true
+                myRoot.CFrame = CFrame.new(0, -10000, 0)
+            end
+            
+            if camera then
+                camera.CameraType = Enum.CameraType.Scriptable
+                local voidPos = Vector3.new(0, -10000, 0)
+                camera.CFrame = CFrame.new(voidPos, voidPos - Vector3.new(0, 1, 0))
+            end
+        end
+
+        EquipSelectedWeapon()
+    end)
+end
+
+function StopFollowRage()
+    if FollowConnection then
+        FollowConnection:Disconnect()
+        FollowConnection = nil
+    end
+    if ClickLoopThread then
+        task.cancel(ClickLoopThread)
+        ClickLoopThread = nil
+    end
+    
+    if Workspace.CurrentCamera then
+        Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+    end
+    
+    CurrentTarget = nil
+    InVoid = false
+    IsInVoidCycle = false
+    flushDesync()
+end
